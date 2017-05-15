@@ -51,7 +51,7 @@ func (f *Fulfiller) Fulfill(s capnp.Struct) {
 	queues := f.emptyQueue(s)
 	ctab := s.Segment().Message().CapTable
 	for capIdx, q := range queues {
-		ctab[capIdx] = newEmbargoClient(ctab[capIdx], q)
+		ctab[capIdx] = capnp.ClientFromHook(newEmbargoClient(ctab[capIdx], q))
 	}
 	close(f.resolved)
 	f.mu.Unlock()
@@ -183,17 +183,19 @@ type pcall struct {
 // made on unresolved answers.  EmbargoClient is exported so that rpc
 // can avoid making calls on its own Conn.
 type EmbargoClient struct {
-	client capnp.Client
+	client   *capnp.Client
+	resolved chan struct{}
 
 	mu    sync.RWMutex
 	q     queue.Queue
 	calls ecallList
 }
 
-func newEmbargoClient(client capnp.Client, queue []ecall) capnp.Client {
+func newEmbargoClient(client *capnp.Client, queue []ecall) *EmbargoClient {
 	ec := &EmbargoClient{
-		client: client,
-		calls:  make(ecallList, callQueueSize),
+		client:   client,
+		resolved: make(chan struct{}),
+		calls:    make(ecallList, callQueueSize),
 	}
 	ec.q.Init(ec.calls, copy(ec.calls, queue))
 	go ec.flushQueue()
@@ -216,6 +218,7 @@ func (ec *EmbargoClient) push(cl *capnp.Call) capnp.Answer {
 
 // flushQueue is run in its own goroutine.
 func (ec *EmbargoClient) flushQueue() {
+	defer close(ec.resolved)
 	var c ecall
 	ec.mu.Lock()
 	if i := ec.q.Front(); i != -1 {
@@ -243,16 +246,20 @@ func (ec *EmbargoClient) flushQueue() {
 	}
 }
 
-// Client returns the underlying client if the embargo has been lifted
+func (ec *EmbargoClient) Resolved() <-chan struct{} {
+	return ec.resolved
+}
+
+// ResolvedClient returns the underlying client if the embargo has been lifted
 // and nil otherwise.
-func (ec *EmbargoClient) Client() capnp.Client {
+func (ec *EmbargoClient) ResolvedClient() capnp.ClientHook {
 	ec.mu.RLock()
 	ok := ec.isPassthrough()
 	ec.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	return ec.client
+	return ec.hook
 }
 
 func (ec *EmbargoClient) isPassthrough() bool {
@@ -267,7 +274,7 @@ func (ec *EmbargoClient) Call(cl *capnp.Call) capnp.Answer {
 	ok := ec.isPassthrough()
 	ec.mu.RUnlock()
 	if ok {
-		return ec.client.Call(cl)
+		return ec.hook.Call(cl)
 	}
 
 	// Add to queue.
@@ -275,11 +282,16 @@ func (ec *EmbargoClient) Call(cl *capnp.Call) capnp.Answer {
 	// Since we released the lock, check that the queue hasn't been flushed.
 	if ec.isPassthrough() {
 		ec.mu.Unlock()
-		return ec.client.Call(cl)
+		return ec.hook.Call(cl)
 	}
 	ans := ec.push(cl)
 	ec.mu.Unlock()
 	return ans
+}
+
+func (ec *EmbargoClient) Brand() interface{} {
+	// TODO(now)
+	return nil
 }
 
 // TryQueue will attempt to queue a call or return nil if the embargo

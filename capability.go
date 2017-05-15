@@ -3,6 +3,7 @@ package capnp
 import (
 	"errors"
 	"strconv"
+	"sync"
 
 	"golang.org/x/net/context"
 )
@@ -54,9 +55,10 @@ func (i Interface) value(paddr Address) rawPointer {
 	return rawInterfacePointer(i.cap)
 }
 
-// Client returns the client stored in the message's capability table
-// or nil if the pointer is invalid.
-func (i Interface) Client() Client {
+// Client returns a new reference to the client stored in the message's
+// capability table or nil if the pointer is invalid.  The caller is
+// responsible for closing the returned client.
+func (i Interface) Client() *Client {
 	if i.seg == nil {
 		return nil
 	}
@@ -64,7 +66,7 @@ func (i Interface) Client() Client {
 	if int64(i.cap) >= int64(len(tab)) {
 		return nil
 	}
-	return tab[i.cap]
+	return tab[i.cap].AddRef()
 }
 
 // ErrNullClient is returned from a call made on a null client pointer.
@@ -73,14 +75,146 @@ var ErrNullClient = errors.New("capnp: call on null client")
 // A CapabilityID is an index into a message's capability table.
 type CapabilityID uint32
 
-// A Client represents an Cap'n Proto interface type.  It is safe to use
-// from multiple goroutines.
+type Client struct {
+	mu     sync.Mutex // protects the struct
+	state  *clientState
+	closed bool
+}
+
+type clientState struct {
+	mu   sync.Mutex // protects the struct
+	hook ClientHook
+	refs int
+}
+
+func ClientFromHook(hook ClientHook) *Client {
+	if hook == nil {
+		return nil
+	}
+	return &Client{state: &clientState{
+		hook: hook,
+		refs: 1,
+	}}
+}
+
+func (c *Client) sync(f func(ClientHook)) {
+	if c == nil {
+		f(nil)
+		return
+	}
+	c.mu.Lock()
+	c.state.mu.Lock()
+	for hook := c.state.hook; ; {
+		select {
+		case <-hook.Resolved():
+			r := hook.ResolvedClient()
+			r.mu.Lock()
+			if r.mu
+			hook = next
+			continue
+		default:
+		}
+		f(c.state.hook)
+		c.state.mu.Unlock()
+		c.mu.Unlock()
+		return
+	}
+}
+
+// Call starts executing a method and returns an answer that will hold
+// the resulting struct.  The call's parameters must be placed before
+// Call() returns.
 //
-// Generally, only RPC protocol implementers should provide types that
-// implement Client: call ordering guarantees, promises, and
-// synchronization are tricky to get right.  Prefer creating a server
-// that wraps another interface than trying to implement Client.
-type Client interface {
+// Calls are delivered to the capability in the order they are made.
+// This guarantee is based on the concept of a capability
+// acknowledging delivery of a call: this is specific to an
+// implementation of Client.  A type that implements Client must
+// guarantee that if foo() then bar() is called on a client, that
+// acknowledging foo() happens before acknowledging bar().
+func (c *Client) Call(call *Call) Answer {
+	var ans Answer
+	c.sync(func(hook ClientHook) {
+		if hook == nil {
+			ans = ErrorAnswer(ErrNullClient)
+			return
+		}
+		ans = hook.Call(call)
+	})
+	return ans
+}
+
+func (c *Client) IsValid() bool {
+	var valid bool
+	c.sync(func(hook ClientHook) {
+		valid = hook != nil
+	})
+	return valid
+}
+
+func (c *Client) AddRef() *Client {
+	if c == nil {
+		return nil
+	}
+	c.state.mu.Lock()
+	if c.state.hook == nil {
+		c.state.mu.Unlock()
+		return nil
+	}
+	if c.state.refs <= 0 {
+		c.state.mu.Unlock()
+		panic("AddRef on closed client")
+	}
+	c.state.refs++
+	c.state.mu.Unlock()
+	return &Client{state: c.state}
+}
+
+// Brand returns the current underlying hook's Brand method.
+func (c *Client) Brand() interface{} {
+	var brand interface{}
+	c.sync(func(hook ClientHook) {
+		if hook != nil {
+			brand = hook.Brand()
+		}
+	})
+	return brand
+}
+
+func (c *Client) Close() error {
+	if c == nil {
+		return ErrNullClient
+	}
+	outcome := 0
+	var err error
+	c.close.Do(func() {
+		c.state.mu.Lock()
+		switch {
+		case c.state.refs < 1:
+			outcome = -1
+		case c.state.refs == 1:
+			outcome = 1
+			err = c.state.hook.Close()
+			c.state.refs = 0
+		default:
+			outcome = 1
+			c.state.refs--
+		}
+		c.state.mu.Unlock()
+	})
+	switch {
+	case outcome == 0:
+		return errors.New("capnp: double close on Client")
+	case outcome == -1:
+		panic("more closes than refs")
+	default:
+		return err
+	}
+}
+
+// A ClientHook represents an Cap'n Proto interface type.  It should not
+// be used directly, and does not need to be safe to be used from
+// multiple goroutines.  Client synchronizes calls to ClientHook methods.
+type ClientHook interface {
 	// Call starts executing a method and returns an answer that will hold
 	// the resulting struct.  The call's parameters must be placed before
 	// Call() returns.
@@ -92,6 +226,21 @@ type Client interface {
 	// guarantee that if foo() then bar() is called on a client, that
 	// acknowledging foo() happens before acknowledging bar().
 	Call(call *Call) Answer
+
+	// If this client is a promise, then Resolve returns a channel that
+	// is closed when the promise resolves.  Otherwise, Resolve returns
+	// a nil channel.  Resolved must return the same channel on every
+	// call.
+	Resolved() <-chan struct{}
+
+	// ResolvedClient returns the resolved client.
+	// ResolvedClient must only be called after the Resolved channel is closed.
+	// The Client containing
+	ResolvedClient() *Client
+
+	// Brand returns an implementation-specific value.  This can be used
+	// to introspect and identify kinds of clients.
+	Brand() interface{}
 
 	// Close releases any resources associated with this client.
 	// No further calls to the client should be made after calling Close.
@@ -404,7 +553,7 @@ func (ans immediateAnswer) Struct() (Struct, error) {
 	return ans.s, nil
 }
 
-func (ans immediateAnswer) findClient(transform []PipelineOp) Client {
+func (ans immediateAnswer) findClient(transform []PipelineOp) *Client {
 	p, err := Transform(ans.s.ToPtr(), transform)
 	if err != nil {
 		return ErrorClient(err)
@@ -413,19 +562,11 @@ func (ans immediateAnswer) findClient(transform []PipelineOp) Client {
 }
 
 func (ans immediateAnswer) PipelineCall(transform []PipelineOp, call *Call) Answer {
-	c := ans.findClient(transform)
-	if c == nil {
-		return ErrorAnswer(ErrNullClient)
-	}
-	return c.Call(call)
+	return ans.findClient(transform).Call(call)
 }
 
 func (ans immediateAnswer) PipelineClose(transform []PipelineOp) error {
-	c := ans.findClient(transform)
-	if c == nil {
-		return ErrNullClient
-	}
-	return c.Close()
+	return ans.findClient(transform).Close()
 }
 
 type errorAnswer struct {
@@ -467,21 +608,33 @@ type errorClient struct {
 }
 
 // ErrorClient returns a Client that always returns error e.
-func ErrorClient(e error) Client {
-	return errorClient{e}
+func ErrorClient(e error) *Client {
+	return ClientFromHook(&errorClient{e})
 }
 
-func (ec errorClient) Call(*Call) Answer {
+func (ec *errorClient) Call(*Call) Answer {
 	return ErrorAnswer(ec.e)
 }
 
-func (ec errorClient) Close() error {
+func (ec *errorClient) Resolved() <-chan struct{} {
+	return closedChan
+}
+
+func (ec *errorClient) ResolvedClient() ClientHook {
+	return ec
+}
+
+func (ec *errorClient) Brand() interface{} {
+	return ec
+}
+
+func (ec *errorClient) Close() error {
 	return nil
 }
 
 // IsErrorClient reports whether c was created with ErrorClient.
-func IsErrorClient(c Client) bool {
-	_, ok := c.(errorClient)
+func IsErrorClient(c *Client) bool {
+	_, ok := c.Brand().(*errorClient)
 	return ok
 }
 
@@ -506,4 +659,11 @@ func IsUnimplemented(e error) bool {
 		e = me.Err
 	}
 	return e == ErrUnimplemented
+}
+
+var closedChan chan struct{}
+
+func init() {
+	closedChan = make(chan struct{})
+	close(closedChan)
 }

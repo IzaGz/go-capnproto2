@@ -4,7 +4,59 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"golang.org/x/net/context"
 )
+
+func TestResolveClient(t *testing.T) {
+	a := &dummyHook{resolved: make(chan struct{})}
+	b := &dummyHook{}
+	ca := ClientFromHook(a)
+	cb := ClientFromHook(b)
+	ctx := context.Background()
+	a.Call(&Call{Ctx: ctx})
+	ca.next = cb
+	close(ca.resolved)
+	a.Call(&Call{Ctx: ctx})
+	if a.Close() {
+	}
+}
+
+type dummyHook struct {
+	next     *Client
+	resolved chan struct{}
+	closed   bool
+}
+
+func (dh *dummyHook) Call(call *Call) Answer {
+	if dh.next == nil {
+		return ErrorAnswer(errors.New("dummy hook answer"))
+	}
+	return dh.next.Call(call)
+}
+
+func (dh *dummyHook) Resolved() <-chan struct{} {
+	return dh.resolved
+}
+
+func (dh *dummyHook) ResolvedClient() *Client {
+	return dh.next
+}
+
+func (dh *dummyHook) Brand() interface{} {
+	if dh.next == nil {
+		return nil
+	}
+	return dh.next.Brand()
+}
+
+func (dh *dummyHook) Close() error {
+	dh.closed = true
+	if dh.next == nil {
+		return nil
+	}
+	return dh.next.Close()
+}
 
 func TestToInterface(t *testing.T) {
 	_, seg, err := NewMessage(SingleSegment(nil))
