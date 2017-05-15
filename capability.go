@@ -76,50 +76,82 @@ var ErrNullClient = errors.New("capnp: call on null client")
 type CapabilityID uint32
 
 type Client struct {
-	mu     sync.Mutex // protects the struct
-	state  *clientState
+	mu     sync.Mutex  // protects the struct
+	h      *clientHook // if non-nil, h.refs > 0
 	closed bool
 }
 
-type clientState struct {
-	mu   sync.Mutex // protects the struct
-	hook ClientHook
+// clientHook is a reference-counted wrapper for a ClientHook.
+// hook will not change for the lifetime of a clientHook.  It is assumed
+// that a clientHook's address uniquely identifies a hook, since they are
+// only created in NewClient.
+type clientHook struct {
+	// mu protects refs, but also should be held whenever calling methods
+	// on hook to prevent a Close.
+	mu   sync.Mutex
+	hook ClientHook // never nil
 	refs int
 }
 
-func ClientFromHook(hook ClientHook) *Client {
+func NewClient(hook ClientHook) *Client {
 	if hook == nil {
 		return nil
 	}
-	return &Client{state: &clientState{
+	return &Client{h: &clientHook{
 		hook: hook,
 		refs: 1,
 	}}
 }
 
-func (c *Client) sync(f func(ClientHook)) {
+func (c *Client) hook() (hook ClientHook, finish func()) {
 	if c == nil {
-		f(nil)
-		return
+		return nil, nopFinish
 	}
 	c.mu.Lock()
-	c.state.mu.Lock()
-	for hook := c.state.hook; ; {
-		select {
-		case <-hook.Resolved():
-			r := hook.ResolvedClient()
-			r.mu.Lock()
-			if r.mu
-			hook = next
-			continue
-		default:
-		}
-		f(c.state.hook)
-		c.state.mu.Unlock()
+	if c.h == nil {
 		c.mu.Unlock()
-		return
+		return nil, nopFinish
+	}
+	c.h.mu.Lock()
+resolve:
+	select {
+	case <-c.h.hook.Resolved():
+		rc := c.h.hook.ResolvedClient()
+		if rc == nil {
+			c.h.refs--
+			c.h.mu.Unlock()
+			c.h = nil
+			c.mu.Unlock()
+			return nil, nopFinish
+		}
+		rc.mu.Lock()
+		if rc.h == c.h {
+			// TODO(soon): Prevent steady-state locking if client keeps returning self.
+			rc.mu.Unlock()
+			return c.h.hook, func() {
+				c.h.mu.Unlock()
+				c.mu.Unlock()
+			}
+		}
+		rc.h.mu.Lock()
+		if rc.h.refs == 0 {
+			// TODO(now): EEP.
+			panic("idk")
+		}
+		rc.h.refs++
+		c.h.refs-- // don't issue a Close on zero, this is a move
+		c.h.mu.Unlock()
+		c.h = rc.h
+		goto resolve
+	default:
+		return c.h.hook, func() {
+			c.h.mu.Unlock()
+			c.mu.Unlock()
+		}
 	}
 }
+
+func nopFinish() {}
 
 // Call starts executing a method and returns an answer that will hold
 // the resulting struct.  The call's parameters must be placed before
@@ -132,83 +164,76 @@ func (c *Client) sync(f func(ClientHook)) {
 // guarantee that if foo() then bar() is called on a client, that
 // acknowledging foo() happens before acknowledging bar().
 func (c *Client) Call(call *Call) Answer {
-	var ans Answer
-	c.sync(func(hook ClientHook) {
-		if hook == nil {
-			ans = ErrorAnswer(ErrNullClient)
-			return
-		}
-		ans = hook.Call(call)
-	})
-	return ans
+	hook, finish := c.hook()
+	defer finish()
+	if hook == nil {
+		return ErrorAnswer(ErrNullClient)
+	}
+	return hook.Call(call)
 }
 
 func (c *Client) IsValid() bool {
-	var valid bool
-	c.sync(func(hook ClientHook) {
-		valid = hook != nil
-	})
-	return valid
+	hook, finish := c.hook()
+	defer finish()
+	return hook != nil
 }
 
 func (c *Client) AddRef() *Client {
 	if c == nil {
 		return nil
 	}
-	c.state.mu.Lock()
-	if c.state.hook == nil {
-		c.state.mu.Unlock()
-		return nil
-	}
-	if c.state.refs <= 0 {
-		c.state.mu.Unlock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
 		panic("AddRef on closed client")
 	}
-	c.state.refs++
-	c.state.mu.Unlock()
-	return &Client{state: c.state}
+	h := c.h
+	if h == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	h.mu.Lock()
+	h.refs++
+	h.mu.Unlock()
+	c.mu.Unlock()
+	return &Client{h: h}
 }
 
 // Brand returns the current underlying hook's Brand method.
 func (c *Client) Brand() interface{} {
-	var brand interface{}
-	c.sync(func(hook ClientHook) {
-		if hook != nil {
-			brand = hook.Brand()
-		}
-	})
-	return brand
+	hook, finish := c.hook()
+	defer finish()
+	if hook == nil {
+		return nil
+	}
+	return hook.Brand()
 }
 
 func (c *Client) Close() error {
 	if c == nil {
 		return ErrNullClient
 	}
-	outcome := 0
-	var err error
-	c.close.Do(func() {
-		c.state.mu.Lock()
-		switch {
-		case c.state.refs < 1:
-			outcome = -1
-		case c.state.refs == 1:
-			outcome = 1
-			err = c.state.hook.Close()
-			c.state.refs = 0
-		default:
-			outcome = 1
-			c.state.refs--
-		}
-		c.state.mu.Unlock()
-	})
-	switch {
-	case outcome == 0:
+	defer c.mu.Unlock()
+	c.mu.Lock()
+	if c.closed {
 		return errors.New("capnp: double close on Client")
-	case outcome == -1:
-		panic("more closes than refs")
-	default:
-		return err
 	}
+	c.closed = true
+	c.h.mu.Lock()
+	var err error
+	switch {
+	case c.h.refs < 1:
+		c.h.mu.Unlock()
+		panic("more closes than refs")
+	case c.h.refs == 1:
+		err = c.h.hook.Close()
+		c.h.refs = 0
+	default:
+		c.h.refs--
+	}
+	c.h.mu.Unlock()
+	c.h = nil
+	return err
 }
 
 // A ClientHook represents an Cap'n Proto interface type.  It should not
@@ -609,7 +634,7 @@ type errorClient struct {
 
 // ErrorClient returns a Client that always returns error e.
 func ErrorClient(e error) *Client {
-	return ClientFromHook(&errorClient{e})
+	return NewClient(&errorClient{e})
 }
 
 func (ec *errorClient) Call(*Call) Answer {
@@ -617,11 +642,11 @@ func (ec *errorClient) Call(*Call) Answer {
 }
 
 func (ec *errorClient) Resolved() <-chan struct{} {
-	return closedChan
+	return nil
 }
 
-func (ec *errorClient) ResolvedClient() ClientHook {
-	return ec
+func (ec *errorClient) ResolvedClient() *Client {
+	panic("*errorClient.ResolvedClient")
 }
 
 func (ec *errorClient) Brand() interface{} {

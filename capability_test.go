@@ -11,14 +11,19 @@ import (
 func TestResolveClient(t *testing.T) {
 	a := &dummyHook{resolved: make(chan struct{})}
 	b := &dummyHook{}
-	ca := ClientFromHook(a)
-	cb := ClientFromHook(b)
+	ca := NewClient(a)
+	cb := NewClient(b)
 	ctx := context.Background()
-	a.Call(&Call{Ctx: ctx})
-	ca.next = cb
-	close(ca.resolved)
-	a.Call(&Call{Ctx: ctx})
-	if a.Close() {
+
+	ca.Call(&Call{Ctx: ctx})
+	a.next = cb
+	close(a.resolved)
+	ca.Call(&Call{Ctx: ctx})
+
+	ca.Close()
+	cb.Close()
+	if a.closed {
+		t.Error("a.closed = true")
 	}
 }
 

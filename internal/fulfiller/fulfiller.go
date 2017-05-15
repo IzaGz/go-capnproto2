@@ -51,7 +51,7 @@ func (f *Fulfiller) Fulfill(s capnp.Struct) {
 	queues := f.emptyQueue(s)
 	ctab := s.Segment().Message().CapTable
 	for capIdx, q := range queues {
-		ctab[capIdx] = capnp.ClientFromHook(newEmbargoClient(ctab[capIdx], q))
+		ctab[capIdx] = capnp.NewClient(newEmbargoClient(ctab[capIdx], q))
 	}
 	close(f.resolved)
 	f.mu.Unlock()
@@ -252,14 +252,14 @@ func (ec *EmbargoClient) Resolved() <-chan struct{} {
 
 // ResolvedClient returns the underlying client if the embargo has been lifted
 // and nil otherwise.
-func (ec *EmbargoClient) ResolvedClient() capnp.ClientHook {
+func (ec *EmbargoClient) ResolvedClient() *capnp.Client {
 	ec.mu.RLock()
 	ok := ec.isPassthrough()
 	ec.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	return ec.hook
+	return ec.client
 }
 
 func (ec *EmbargoClient) isPassthrough() bool {
@@ -274,7 +274,7 @@ func (ec *EmbargoClient) Call(cl *capnp.Call) capnp.Answer {
 	ok := ec.isPassthrough()
 	ec.mu.RUnlock()
 	if ok {
-		return ec.hook.Call(cl)
+		return ec.client.Call(cl)
 	}
 
 	// Add to queue.
@@ -282,7 +282,7 @@ func (ec *EmbargoClient) Call(cl *capnp.Call) capnp.Answer {
 	// Since we released the lock, check that the queue hasn't been flushed.
 	if ec.isPassthrough() {
 		ec.mu.Unlock()
-		return ec.hook.Call(cl)
+		return ec.client.Call(cl)
 	}
 	ans := ec.push(cl)
 	ec.mu.Unlock()
