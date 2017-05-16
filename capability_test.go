@@ -20,10 +20,17 @@ func TestResolveClient(t *testing.T) {
 	close(a.resolved)
 	ca.Call(&Call{Ctx: ctx})
 
-	ca.Close()
-	cb.Close()
+	if err := ca.Close(); err != nil {
+		t.Error("ca.Close() =", err)
+	}
+	if err := cb.Close(); err != nil {
+		t.Error("cb.Close() =", err)
+	}
 	if a.closed {
 		t.Error("a.closed = true")
+	}
+	if !b.closed {
+		t.Error("b.closed = false")
 	}
 }
 

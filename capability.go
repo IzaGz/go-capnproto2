@@ -124,9 +124,16 @@ resolve:
 			c.mu.Unlock()
 			return nil, nopFinish
 		}
+		if rc == c {
+			// TODO(soon): Prevent steady-state locking if client returns self.
+			return c.h.hook, func() {
+				c.h.mu.Unlock()
+				c.mu.Unlock()
+			}
+		}
 		rc.mu.Lock()
 		if rc.h == c.h {
-			// TODO(soon): Prevent steady-state locking if client keeps returning self.
+			// TODO(soon): Prevent steady-state locking if client returns self.
 			rc.mu.Unlock()
 			return c.h.hook, func() {
 				c.h.mu.Unlock()
@@ -142,6 +149,7 @@ resolve:
 		c.h.refs-- // don't issue a Close on zero, this is a move
 		c.h.mu.Unlock()
 		c.h = rc.h
+		rc.mu.Unlock()
 		goto resolve
 	default:
 		return c.h.hook, func() {
@@ -219,11 +227,11 @@ func (c *Client) Close() error {
 		return errors.New("capnp: double close on Client")
 	}
 	c.closed = true
+	defer c.h.mu.Unlock()
 	c.h.mu.Lock()
 	var err error
 	switch {
 	case c.h.refs < 1:
-		c.h.mu.Unlock()
 		panic("more closes than refs")
 	case c.h.refs == 1:
 		err = c.h.hook.Close()
@@ -231,7 +239,6 @@ func (c *Client) Close() error {
 	default:
 		c.h.refs--
 	}
-	c.h.mu.Unlock()
 	c.h = nil
 	return err
 }
