@@ -445,8 +445,8 @@ func (p *Pipeline) Struct() (Struct, error) {
 }
 
 // Client returns the client version of p.
-func (p *Pipeline) Client() *PipelineClient {
-	return (*PipelineClient)(p)
+func (p *Pipeline) Client() *Client {
+	return NewClient((*pipelineClient)(p))
 }
 
 // GetPipeline returns a derived pipeline which yields the pointer field given.
@@ -467,20 +467,33 @@ func (p *Pipeline) GetPipelineDefault(off uint16, def []byte) *Pipeline {
 	}
 }
 
-// PipelineClient implements Client by calling to the pipeline's answer.
-type PipelineClient Pipeline
+// pipelineClient implements Client by calling to the pipeline's answer.
+type pipelineClient Pipeline
 
-func (pc *PipelineClient) transform() []PipelineOp {
+func (pc *pipelineClient) transform() []PipelineOp {
 	return (*Pipeline)(pc).Transform()
 }
 
 // Call calls Answer.PipelineCall with the pipeline's transform.
-func (pc *PipelineClient) Call(call *Call) Answer {
+func (pc *pipelineClient) Call(call *Call) Answer {
 	return pc.answer.PipelineCall(pc.transform(), call)
 }
 
+func (pc *pipelineClient) Resolved() <-chan struct{} {
+	// TODO(soon): wait on answer
+	return nil
+}
+
+func (pc *pipelineClient) ResolvedClient() *Client {
+	panic("unreachable")
+}
+
+func (pc *pipelineClient) Brand() interface{} {
+	return nil
+}
+
 // Close calls Answer.PipelineClose with the pipeline's transform.
-func (pc *PipelineClient) Close() error {
+func (pc *pipelineClient) Close() error {
 	return pc.answer.PipelineClose(pc.transform())
 }
 
